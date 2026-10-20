@@ -64,6 +64,7 @@ import { useEditorContext } from "../../context/editor"
 import { useDialog } from "../../ui/dialog"
 import { DialogSelect } from "../../ui/dialog-select"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
+import { TodoItem } from "../../component/todo-item"
 import { DialogImagePreview } from "../../component/dialog-image-preview"
 import { statusLabel } from "../../component/dialog-workspace-file-changes"
 import { DialogMessage } from "./dialog-message"
@@ -86,7 +87,7 @@ import { FormPrompt } from "./form"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import { DialogExportResult } from "../../ui/dialog-export-result"
 import { sessionEpilogue } from "../../util/presentation"
-import { useConfig } from "../../config"
+import { useConfig, useNewDesigns } from "../../config"
 import { useClipboard } from "../../context/clipboard"
 import { nextThinkingMode, type ThinkingMode } from "../../context/thinking"
 import { getScrollAcceleration } from "../../util/scroll"
@@ -120,6 +121,7 @@ import { createSingleFlight } from "../../util/single-flight"
 import { createDelayedPresence } from "../../util/delayed-presence"
 import { SessionLocationMissing } from "./location-missing"
 import { isRecord } from "../../util/record"
+import { parseTodos } from "../../util/todo"
 import { createHistoryPrepend } from "./history"
 import { context, use, type PendingAction } from "./render-context"
 import { INLINE_TOOL_ICON_WIDTH, InlineToolRow, ReasoningPart, TextPart, toolDisplay } from "./message-parts"
@@ -647,6 +649,8 @@ export function Session(props: {
     dialog.replace(() => (
       <DialogSelect
         title="Queued prompts"
+        searchInTitle
+        titlePlaceholder="Search queued prompts"
         options={queuedPrompts().map((prompt, index) => ({
           title: prompt.text,
           value: prompt.id,
@@ -695,14 +699,9 @@ export function Session(props: {
             },
           },
         ]}
-        footerHints={[{ title: "steer", label: "enter" }]}
+        footerHints={[{ title: "steer", label: "enter", group: "primary" }]}
       />
     ))
-  const unavailable = (feature: string) => {
-    toast.show({ message: `${feature} is not implemented for V2 sessions yet`, variant: "error", duration: 5000 })
-    dialog.clear()
-  }
-
   const alignMessage = (messageID: string, top: number) => {
     scroll.stickyScroll = false
     setNavigationMessage(messageID)
@@ -912,14 +911,6 @@ export function Session(props: {
   ]
 
   const baseCommands = createMemo(() => [
-    {
-      title: "Share session",
-      id: "session.share",
-      suggested: route.type === "session",
-      group: "Session",
-      slash: { name: "share" },
-      run: () => unavailable("Sharing"),
-    },
     {
       title: "Rename session",
       id: "session.rename",
@@ -1153,9 +1144,12 @@ export function Session(props: {
       title: "Copy last assistant message",
       id: "messages.copy",
       group: "Session",
+      slash: {
+        name: "copy",
+      },
       run: () => {
         const lastAssistantMessage = messagesBeforeRevert().findLast(
-          (msg): msg is SessionMessageAssistant => msg.type === "assistant",
+          (msg) => msg.type === "assistant" || (msg.type === "compaction" && msg.status === "completed" && msg.summary.trim() !== ""),
         )
         if (!lastAssistantMessage) {
           toast.show({ message: "No assistant messages found", variant: "error" })
@@ -1163,17 +1157,16 @@ export function Session(props: {
           return
         }
 
-        const textParts = lastAssistantMessage.content.filter((part) => part.type === "text")
-        if (textParts.length === 0) {
-          toast.show({ message: "No text parts found in last assistant message", variant: "error" })
-          dialog.clear()
-          return
-        }
-
-        const text = textParts
-          .map((part) => part.text)
-          .join("\n")
-          .trim()
+        const text =
+          lastAssistantMessage.type === "assistant"
+            ? lastAssistantMessage.content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join("\n")
+                .trim()
+            : lastAssistantMessage.type === "compaction" && lastAssistantMessage.status === "completed"
+              ? lastAssistantMessage.summary.trim()
+              : ""
         if (!text) {
           toast.show({
             message: "No text content found in last assistant message",
@@ -1206,9 +1199,6 @@ export function Session(props: {
       title: "Copy session transcript",
       id: "session.copy",
       group: "Session",
-      slash: {
-        name: "copy",
-      },
       run: async () => {
         try {
           const sessionData = session()
@@ -2232,6 +2222,7 @@ function ShellMessage(props: { message: Extract<SessionMessageInfo, { type: "she
 
 function UserMessage(props: { message: SessionMessageUser }) {
   const ctx = use()
+  const newDesigns = useNewDesigns()
   const data = useData()
   const local = useLocal()
   const files = createMemo(() => deduplicateVisibleImages(props.message.files ?? []))
@@ -2277,6 +2268,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
               dialog.replace(() => (
                 <DialogSelect
                   title="Pending steer"
+                  renderFilter={!newDesigns()}
                   options={[
                     { title: "Move to queue", value: "queue" as const },
                     { title: "Delete", value: "cancel" as const },
@@ -2479,6 +2471,9 @@ function ToolPart(props: { part: SessionMessageAssistantTool; images?: boolean }
       </Match>
       <Match when={display() === "patch"}>
         <ApplyPatch {...toolprops} />
+      </Match>
+      <Match when={display() === "todowrite"}>
+        <TodoWrite {...toolprops} />
       </Match>
       <Match when={display() === "question"}>
         <Question {...toolprops} />
@@ -3471,6 +3466,32 @@ function ApplyPatch(props: ToolProps) {
           headerColor={props.part.state.status === "error" ? theme.text.feedback.error.base : undefined}
           errorColor={props.part.state.status === "error" ? theme.text.muted : undefined}
         />
+      </Match>
+    </Switch>
+  )
+}
+
+function TodoWrite(props: ToolProps) {
+  const theme = useTheme()
+  const todos = createMemo(() => parseTodos(props.input.todos))
+  return (
+    <Switch>
+      <Match when={props.part.state.status === "completed" && todos().length > 0}>
+        <BlockTool title="# Todos" part={props.part}>
+          <box>
+            <For each={todos()}>{(todo) => <TodoItem theme={theme} todo={todo} />}</For>
+          </box>
+        </BlockTool>
+      </Match>
+      <Match when={true}>
+        <InlineTool
+          icon="⚙"
+          pending="Updating todos…"
+          complete={props.part.state.status === "completed" || props.part.state.status === "error"}
+          part={props.part}
+        >
+          {props.part.state.status === "error" ? "Todo update failed" : "Cleared todos"}
+        </InlineTool>
       </Match>
     </Switch>
   )

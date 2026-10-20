@@ -54,6 +54,7 @@ import { SessionUsage } from "@opencode/core/session/usage"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { PluginPromise } from "@opencode/core/plugin/promise"
 import { OptimizePlugin } from "@opencode/core/plugin/optimize"
 import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { QuestionTool } from "@opencode/core/tool/plugin/question"
@@ -1739,6 +1740,34 @@ describe("SessionRunnerLLM", () => {
     expect(yield* s.messages).toHaveLength(3)
   })
 
+  scenario("keeps the system prompt stable across a committed revert", function* (s) {
+    yield* s.runPrompt("First")
+    s.systemBaseline = "Changed context"
+    yield* s.runPrompt("Second")
+    const third = yield* s.runPrompt("Third")
+    const before = s.requests.at(-1)?.system.map((part) => part.text)
+    expect(before).toEqual([defaultSystem, fakeIdentity, "Initial context"])
+
+    yield* s.bus.publish(SessionEvent.RevertEvent.Committed, { sessionID, to: third.id })
+    yield* s.runPrompt("Fourth")
+
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual(before)
+  })
+
+  scenario("resyncs the instruction state when a committed revert removes an update", function* (s) {
+    yield* s.runPrompt("First")
+    s.systemBaseline = "Changed context"
+    const second = yield* s.runPrompt("Second")
+    s.systemBaseline = "Latest context"
+    yield* s.runPrompt("Third")
+
+    // The "Latest context" update is delivered with "Third", after the boundary.
+    yield* s.bus.publish(SessionEvent.RevertEvent.Committed, { sessionID, to: second.id })
+    yield* s.runPrompt("Fourth")
+
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Latest context"])
+  })
+
   scenario("uses the selected model family prompt when the agent does not override it", function* (s) {
     s.currentModel = LanguageModel.make({ id: "gpt-5", provider: "openai", route: OpenAIChat.route })
     yield* s.admit("First")
@@ -2557,7 +2586,7 @@ describe("SessionRunnerLLM", () => {
           role: "user",
           content: [{ type: "text", text: SessionCompaction.buildPrompt(false) }],
         })
-        expect(userTexts(compact)).not.toContain("Retained recent request")
+        expect(userTexts(compact).includes("Retained recent request")).toBe(reason === "auto")
         for (const field of [
           "model",
           "system",
@@ -3008,7 +3037,9 @@ describe("SessionRunnerLLM", () => {
     expect(userTexts(s.requests[0])[0]).toContain("older exchanges omitted")
     expect(userTexts(s.requests[0])[0]).not.toContain("Request 0:")
     expect(userTexts(s.requests[0])[0]).not.toContain("Request 1:")
+    // The latest exchange is the retained tail, so shrinking drops only exchanges before it.
     expect(userTexts(s.requests[0])[0]).toContain("Request 2:")
+    expect(userTexts(s.requests[0])[0]).not.toContain("Request 3:")
     expect((yield* s.messages).find((message) => message.id === compaction.id)).toMatchObject({
       status: "completed",
       summary: "## Objective\n- Recovered",
@@ -3102,6 +3133,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Recent exact request ".repeat(180))
 
     expect(s.requests).toHaveLength(2)
+    expect(JSON.stringify(s.requests[0].messages)).toContain("Recent exact request ".repeat(180))
     expect(userTexts(s.requests[0]).at(-1)).toContain("## Objective")
     expect(userTexts(s.requests[1])).toHaveLength(1)
     expect(userTexts(s.requests[1])[0]).toContain("<summary>\n## Objective\n- Preserve the task\n</summary>")
@@ -3483,13 +3515,13 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests).toHaveLength(2)
     expect(userTexts(s.requests[0]).at(-1)).toContain("## Objective")
-    // The summary may use the whole 20k reserve of a 200k window.
-    expect(s.requests[0]?.generation?.maxTokens).toBe(20_000)
+    // The summary may use the whole 30k reserve of a 200k window.
+    expect(s.requests[0]?.generation?.maxTokens).toBe(30_000)
     expect(s.requests[1]?.generation?.maxTokens).toBe(32_000)
   })
 
   scenario("keeps the summary its room on a small window", function* (s) {
-    // 90% of 64k would leave 6.4k for the summary, so the 16k reserve sets the ceiling at 48k instead.
+    // 85% of 64k would leave 9.6k for the summary, so the 16k reserve sets the ceiling at 48k instead.
     s.currentModel = smallWindowModel
     yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-small-first", 59_000))
     yield* s.runPrompt("Earlier question")
@@ -4867,6 +4899,43 @@ describe("SessionRunnerLLM", () => {
       "session.tool.called.1",
       "session.tool.failed.2",
       "session.step.ended.1",
+    ])
+  })
+
+  scenario("preserves each parallel Promise hook failure", function* (s) {
+    const hooks = yield* PluginHooks.Service
+    const calls: string[] = []
+    yield* PluginPromise.fromPromise({
+      id: "parallel-hook-errors",
+      async setup(context) {
+        await context.tool.hook("execute.before", (event) => {
+          calls.push(event.id)
+          if (event.id === "call-alpha") throw new Error("HOOK BLOCK ALPHA")
+          if (event.id === "call-beta") throw new Error("HOOK BLOCK BETA")
+        })
+      },
+    }).effect(host({ tool: { ...host().tool, hook: (name, callback) => hooks.register("tool", name, callback) } }))
+    yield* s.admit("Run parallel guarded tools")
+    yield* s.llm.push(
+      TestLLM.toolCalls(
+        LLMEvent.toolCall({ id: "call-alpha", name: "echo", input: { text: "alpha-block" } }),
+        LLMEvent.toolCall({ id: "call-beta", name: "echo", input: { text: "beta-block" } }),
+        LLMEvent.toolCall({ id: "call-ok", name: "echo", input: { text: "ok" } }),
+      ),
+      TestLLM.stop(),
+    )
+    yield* s.resume
+    expect(calls).toEqual(["call-alpha", "call-beta", "call-ok"])
+    expect(s.executions).toEqual(["ok"])
+    expect(s.requests).toHaveLength(2)
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Run parallel guarded tools"),
+      Expected.assistant({}, [
+        Expected.failedTool({ id: "call-alpha" }, { error: { message: "HOOK BLOCK ALPHA" } }),
+        Expected.failedTool({ id: "call-beta" }, { error: { message: "HOOK BLOCK BETA" } }),
+        Expected.completedTool({ id: "call-ok" }, { content: [{ type: "text", text: "ok" }] }),
+      ]),
+      { type: "assistant", finish: "stop" },
     ])
   })
 
