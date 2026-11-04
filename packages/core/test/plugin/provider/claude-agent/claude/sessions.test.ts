@@ -1,12 +1,16 @@
 import { describe, expect } from "bun:test"
+import { mkdir, rm, writeFile } from "node:fs/promises"
+import path from "node:path"
 import { Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 import { ClaudeSessions } from "@opencode/core/plugin/provider/claude-agent/claude/sessions"
+import { ClaudeIO } from "@opencode/core/plugin/provider/claude-agent/claude/io"
 import { ClaudeAgentLanguageModel } from "@opencode/core/plugin/provider/claude-agent/language-model/claude-agent-language-model"
 import { RequestKind } from "@opencode/core/plugin/provider/claude-agent/language-model/request-kind"
 import { ClaudeSystemPrompt } from "@opencode/core/plugin/provider/claude-agent/language-model/system-prompt"
 import { SessionRecord } from "@opencode/core/plugin/provider/claude-agent/sync/record"
 import { it } from "../../../../lib/effect"
+import { tmpdirScoped } from "../../../../fixture/tmpdir"
 import { FakeClaude } from "../lib/fake-claude"
 import { TestSessions } from "../lib/sessions"
 import { TestTools } from "../lib/tools"
@@ -15,6 +19,65 @@ import { Recorder } from "../lib/recorder"
 const first = TestSessions.prompt("Remember the marker COPPER-OTTER. Reply only with that marker.")
 
 describe("Claude sessions", () => {
+  it.live("a deleted directory reports how to recover, and moving the session allows it to resume", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const directory = path.join(tmp.path, "worktree")
+      yield* Effect.promise(() => mkdir(directory))
+      const claude = FakeClaude.make([
+        FakeClaude.expectStartup(),
+        FakeClaude.expectTurn(),
+        FakeClaude.expectInterrupt(),
+        FakeClaude.expectStartup(),
+        FakeClaude.expectTurn({ index: 1 }),
+        FakeClaude.expectInterrupt(),
+      ])
+      const test = yield* TestSessions.start(claude)
+      const input = { ...test.input, directory, io: { ...test.input.io, isDirectory: ClaudeIO.real.isDirectory } }
+      const sessions = yield* test.registry.attach(input)
+      const model = yield* TestSessions.model(sessions)
+      expect(TestSessions.text(yield* TestSessions.reply(model, first))).toBe("COPPER-OTTER")
+      yield* test.registry.close()
+      yield* Effect.promise(() => rm(directory, { recursive: true }))
+
+      const error = yield* TestSessions.reply(model, TestSessions.followup()).pipe(Effect.flip)
+      expect(String(error.cause)).toContain(`Session directory "${directory}"`)
+      expect(String(error.cause)).toContain("/cd")
+      expect(claude.runs).toHaveLength(1)
+
+      const moved = yield* test.registry.attach({ ...input, directory: tmp.path })
+      const recovered = yield* TestSessions.model(moved)
+      expect(TestSessions.text(yield* TestSessions.reply(recovered, TestSessions.followup()))).toBe("COPPER-OTTER")
+      expect(claude.runs).toHaveLength(2)
+      yield* test.registry.close()
+      claude.check()
+    }),
+  )
+
+  it.live("side calls reject a directory path replaced by a file before starting Claude", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const directory = path.join(tmp.path, "worktree")
+      yield* Effect.promise(() => writeFile(directory, "not a directory"))
+      const claude = FakeClaude.make([
+        FakeClaude.expectStartup(),
+        FakeClaude.expectTurn(),
+        FakeClaude.expectInterrupt(),
+      ])
+      const test = yield* TestSessions.start(claude)
+      const sessions = yield* test.registry.attach({
+        ...test.input,
+        directory,
+        io: { ...test.input.io, isDirectory: ClaudeIO.real.isDirectory },
+      })
+      const model = yield* TestSessions.model(sessions)
+      const error = yield* TestSessions.reply(model, first, "session-a", "generate").pipe(Effect.flip)
+      expect(String(error.cause)).toContain(`Session directory "${directory}"`)
+      expect(String(error.cause)).toContain("/cd")
+      expect(claude.runs).toHaveLength(0)
+    }),
+  )
+
   it.effect("streams consecutive turns once, on one process, with per-turn usage", () =>
     Effect.gen(function* () {
       const claude = FakeClaude.make([

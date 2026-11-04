@@ -87,6 +87,11 @@ export async function session(input: {
   readonly persist: boolean
   readonly resume?: string
 }): Promise<Options> {
+  if (!(await input.io.isDirectory(input.directory))) {
+    throw new Error(
+      `Session directory "${input.directory}" no longer exists or is not a directory. Use /cd to move the session to an existing directory.`,
+    )
+  }
   const options: Options = {
     ...base(input),
     cwd: input.directory,
